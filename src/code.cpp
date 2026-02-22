@@ -18,6 +18,13 @@ i2s_chan_handle_t rx_handle;
 #define I2S_STD_DOUT_IO1        GPIO_NUM_4      // I2S data out io number
 #define I2S_STD_DIN_IO1         GPIO_NUM_16      // I2S data in io number
 
+#define HSPI_SCK 12
+#define HSPI_MISO 13
+#define HSPI_MOSI 11
+#define SD_CS 10
+
+SPIClass *hspi = NULL;  // SPI object
+
 void writeFile(fs::FS &fs, const char * path, const char * message){
   Serial.printf("Writing file: %s\n", path);
 
@@ -34,11 +41,41 @@ void writeFile(fs::FS &fs, const char * path, const char * message){
   file.close();
 }
 
+void writeWavHeader(File &file, uint32_t dataSize, uint32_t sampleRate,
+                    uint16_t bitsPerSample, uint16_t channels)
+{
+  uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+  uint16_t blockAlign = channels * bitsPerSample / 8;
+  uint32_t chunkSize = 36 + dataSize;
+
+  file.seek(0);
+
+  file.write((const uint8_t *)"RIFF", 4);
+  file.write((uint8_t *)&chunkSize, 4);
+  file.write((const uint8_t *)"WAVE", 4);
+
+  file.write((const uint8_t *)"fmt ", 4);
+  uint32_t subChunk1Size = 16;
+  uint16_t audioFormat = 1;
+
+  file.write((uint8_t *)&subChunk1Size, 4);
+  file.write((uint8_t *)&audioFormat, 2);
+  file.write((uint8_t *)&channels, 2);
+  file.write((uint8_t *)&sampleRate, 4);
+  file.write((uint8_t *)&byteRate, 4);
+  file.write((uint8_t *)&blockAlign, 2);
+  file.write((uint8_t *)&bitsPerSample, 2);
+
+  file.write((const uint8_t *)"data", 4);
+  file.write((uint8_t *)&dataSize, 4);
+}
+
 void i2s_setup();
 // void dac_setup();
 static void i2s_example_read_task(void* args);
 static void i2s_example_write_task(void* args);
 // static void i2s_example_dsp_task(void* args);
+static void i2s_record_task(void* args);
 
 void i2s_setup() {
   /* Allocate a pair of I2S channel */
@@ -70,6 +107,58 @@ void i2s_setup() {
   Serial.printf("Enable I2S RX: %x\n", i2s_channel_enable(rx_handle));
 }
 
+
+static void i2s_record_task(void* args)
+{
+  const char* filename = "/record.wav";
+
+  File audioFile = SD.open(filename, FILE_WRITE);
+  if (!audioFile) {
+    Serial.println("Failed to open WAV file");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Reserve space for WAV header
+  uint8_t header[44] = {0};
+  audioFile.write(header, 44);
+
+  uint8_t* buffer = (uint8_t*)malloc(AUDIO_BUFF_SIZE);
+  size_t bytesRead = 0;
+  uint32_t totalBytes = 0;
+
+  Serial.println("Recording...");
+
+  uint32_t startTime = millis();
+  uint32_t recordTimeMs = 10000; // 10 seconds
+
+  while (millis() - startTime < recordTimeMs) {
+
+    if (i2s_channel_read(rx_handle, buffer, AUDIO_BUFF_SIZE,
+                         &bytesRead, portMAX_DELAY) == ESP_OK)
+    {
+      audioFile.write(buffer, bytesRead);
+      totalBytes += bytesRead;
+    }
+  }
+
+  Serial.println("Recording finished");
+
+  // Write correct WAV header
+  writeWavHeader(audioFile,
+                 totalBytes,
+                 48000,
+                 32,
+                 2);
+
+  audioFile.close();
+  free(buffer);
+
+  Serial.println("File saved.");
+  vTaskDelete(NULL);
+}
+
+
 void setup() {
 
   // Set up Serial Monitor
@@ -77,18 +166,16 @@ void setup() {
   delay(1000);
   Serial.println("hello");
 
-  delay(1000);
-
-  if(!SD.begin(10)){
+  delay(2000);
+  // setup SD card reader
+  hspi = new SPIClass(HSPI);                           // create SPI class
+  hspi->begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, SD_CS);  // setup SPI pins
+  if (!SD.begin(SD_CS, *hspi)) {                       // mount card
     Serial.println("Card Mount Failed");
     return;
   }
-  uint8_t cardType = SD.cardType();
 
-  if(cardType == CARD_NONE){
-    Serial.println("No SD card attached");
-    return;
-  }
+
   // Set up I2S
   i2s_setup();
 
@@ -96,7 +183,8 @@ void setup() {
   // dac_setup();
 
   delay(500);
-  writeFile(SD, "/hello.txt", "Hello ");
+
+  // writeFile(SD, "/hello.txt", "Hello ");
 
   // Loopback/DSP task
   // xTaskCreate(i2s_example_dsp_task, "i2s_example_dsp_task", 4096, NULL, 5, NULL);
@@ -104,6 +192,14 @@ void setup() {
   // Debug tasks
   // xTaskCreate(i2s_example_read_task, "i2s_example_read_task", 4096, NULL, 5, NULL);
   //xTaskCreate(i2s_example_write_task, "i2s_example_write_task", 4096, NULL, 5, NULL);
+
+  // Start recording task
+  xTaskCreate(i2s_record_task,
+              "i2s_record_task",
+              8192,
+              NULL,
+              5,
+              NULL);
 }
 
 void loop() {
